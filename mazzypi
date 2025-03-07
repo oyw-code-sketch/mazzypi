@@ -246,6 +246,53 @@ void updatePosition(int dx, int dy) {
   Serial.print("Moved to: ("); Serial.print(posX); Serial.print(", "); Serial.print(posY); Serial.println(")");
 } 
 
+int baseSpeed = 100;
+void turnByDegrees(float degrees, int baseSpeed) {
+  float target = fabs(degrees);
+  // Start the appropriate turn
+  if (degrees > 0) {
+    driveTurnRight(baseSpeed);
+  } else if (degrees < 0) {
+    driveTurnLeft(baseSpeed);
+  } else return;
+
+  float accumulated = 0.0;
+  unsigned long lastTime = micros();
+  while (accumulated < target) {
+
+    update();
+    accumulated = fabs(yaw);
+    if (millis() - lastTime > 5000) {
+          Serial.println("Turn timed out!");
+          break; // Exit the loop if it takes too long
+  }
+  driveStop();
+  // Update current orientation
+  if (degrees > 0)
+    currentDirection = (currentDirection + 1) % 4;
+  else if (degrees < 0)
+    currentDirection = (currentDirection + 3) % 4;
+}
+}
+
+// ======================
+// Function: moveForwardOneCell()
+// Drives forward exactly one cell (25 cm) using encoder feedback.
+void moveForwardOneCell(int speed) {
+  enc.write(0);
+  driveForward(speed);
+  while (abs(enc.read()) < cellDistanceTicks) {
+    // Optionally add gyro corrections here if needed.
+  }
+  driveStop();
+  // Update cell position based on current direction:
+  if (currentDirection == 0) posY += 1;       // North
+  else if (currentDirection == 1) posX += 1;  // East
+  else if (currentDirection == 2) posY -= 1;  // South
+  else if (currentDirection == 3) posX -= 1;  // West
+}
+
+
 void stopMovement() {
   driveForward(0); // Stop motors
   Serial.println("Exploration complete. Robot stopped.");
