@@ -400,7 +400,40 @@ void loop() {
       Serial.println("Distance Grid Initialized.");
     }
   }
+  computeDistances(GOAL_X, GOAL_Y);
+  //decideAndMove(false);
+  if(posX == GOAL_X && posY == GOAL_Y) {
+    driveStop();
+     mazeSolved = true;
+    Serial.println("Goal reached! Exploration complete.");
+    EEPROM.update(EEPROM_FLAG_ADDR, 0xA5);
+    int idx = 0;
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      for (int x = 0; x < MAZE_SIZE; x++) {
+        EEPROM.update(EEPROM_MAZE_START_ADDR + idx, wallsGrid[y][x]);
+        idx++;
+       }
+    }
+    Serial.println("Maze data saved to EEPROM.");
+    // Prepare for a fast run using the known maze.
+    computeDistances(GOAL_X, GOAL_Y);
+    posX = START_X; posY = START_Y;
+    currentDirection = 0;
+    fastRun = true;
+  } 
+  else if(fastRun) {
+    if(posX == GOAL_X && posY == GOAL_Y) {
+      driveStop();
+      Serial.println("Fast run complete!");
+      fastRun = false;
+      while(true) { delay(1000); }
+    } else {
+      //decideAndMove(true);
+    }
+  }
+  delay(5);
 }
+
 
 
 
