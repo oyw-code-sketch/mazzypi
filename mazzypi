@@ -31,7 +31,7 @@ const int ECHO_RIGHT = 13;
 // ======================
 // Maze & Competition Parameters (from Rule Book [])
 // ======================
-const int MAZE_SIZE = 8;   // 10 x 10 grid
+const int MAZE_SIZE = 10;   // 10 x 10 grid
 const int CELL_SIZE_CM = 25;  // Each cell is 25cm x 25cm
 
 // Define starting and goal positions.
@@ -54,10 +54,11 @@ int cellDistanceTicks = 200; // Example value; adjust based on your setup
 // ======================
 int currentDirection = 0;  // Orientation: 0 = North, 1 = East, 2 = South, 3 = West
 int posX = START_X, posY = START_Y;  // Robot's current cell position
-
+uint8_t wallsGrid[MAZE_SIZE][MAZE_SIZE] = {0}; 
 // Maze mapping arrays
 uint8_t distanceGrid[MAZE_SIZE][MAZE_SIZE];   // Flood-fill distances
-uint8_t wallsGrid[MAZE_SIZE][MAZE_SIZE] = {0}; 
+
+// Wall bits: bit0 = North, bit1 = East, bit2 = South, bit3 = West
 
 // ======================
 // MPU-6050 Sensor
@@ -101,7 +102,7 @@ void scanWalls() {
     long dFront = measureDistance(TRIG_FRONT, ECHO_FRONT);
     long dLeft = measureDistance(TRIG_LEFT, ECHO_LEFT);
     long dRight = measureDistance(TRIG_RIGHT, ECHO_RIGHT);
-    unsigned int dBack = 100;
+
     uint8_t wallBits = 0;
     if (dFront < WALL_DISTANCE_CM) {
         wallBits |= 0x01; // North wall
@@ -112,12 +113,15 @@ void scanWalls() {
     if (dRight < WALL_DISTANCE_CM) {
         wallBits |= 0x02; // East wall
     }
+    if (measureDistance(TRIG_FRONT, ECHO_FRONT) < WALL_DISTANCE_CM) wallBits |= (1 << currentDirection);
+    if (measureDistance(TRIG_LEFT, ECHO_LEFT) < WALL_DISTANCE_CM) wallBits |= (1 << ((currentDirection + 3) % 4));
+    if (measureDistance(TRIG_RIGHT, ECHO_RIGHT) < WALL_DISTANCE_CM) wallBits |= (1 << ((currentDirection + 1) % 4));
     wallsGrid[posY][posX] |= wallBits;
 
     Serial.print("Walls at (");
-    Serial.print(posY);
-    Serial.print(", ");
     Serial.print(posX);
+    Serial.print(", ");
+    Serial.print(posY);
     Serial.print("): ");
     Serial.println(wallsGrid[posY][posX], BIN);
 
@@ -219,6 +223,26 @@ void driveForward(int speed) {
   analogWrite(ENB, speed);
 }
 
+void moveForward(int speed) {
+    enc.write(0);
+    driveForward(speed);
+    while (abs(enc.read()) < cellDistanceTicks) delay(10);
+    driveStop();
+    
+    int dx = 0, dy = 0;
+    switch (currentDirection) {
+        case 0: dy = 1; break;  // North: y+1
+        case 1: dx = 1; break;  // East: x+1
+        case 2: dy = -1; break; // South: y-1
+        case 3: dx = -1; break; // West: x-1
+    }
+    if (posX + dx >= 0 && posX + dx < MAZE_SIZE && posY + dy >= 0 && posY + dy < MAZE_SIZE) {
+        posX += dx;
+        posY += dy;
+    }
+    Serial.print("Moved to: ("); Serial.print(posX); Serial.print(", "); Serial.print(posY); Serial.println(")");
+}
+
 void driveTurnLeft(int speed) {
   // In-place left turn: left motor backward, right motor forward
   digitalWrite(IN1, LOW);
@@ -227,6 +251,7 @@ void driveTurnLeft(int speed) {
   digitalWrite(IN4, LOW);
   analogWrite(ENA, speed);
   analogWrite(ENB, speed);
+  currentDirection = (currentDirection - 1 + 4) % 4;
 }
 
 void driveTurnRight(int speed) {
@@ -237,6 +262,7 @@ void driveTurnRight(int speed) {
   digitalWrite(IN4, HIGH);
   analogWrite(ENA, speed);
   analogWrite(ENB, speed);
+  currentDirection = (currentDirection + 1) % 4;
 }
 
 // === Position Update ===
@@ -245,52 +271,6 @@ void updatePosition(int dx, int dy) {
   posY += dy;
   Serial.print("Moved to: ("); Serial.print(posX); Serial.print(", "); Serial.print(posY); Serial.println(")");
 } 
-
-int baseSpeed = 100;
-void turnByDegrees(float degrees, int baseSpeed) {
-  float target = fabs(degrees);
-  // Start the appropriate turn
-  if (degrees > 0) {
-    driveTurnRight(baseSpeed);
-  } else if (degrees < 0) {
-    driveTurnLeft(baseSpeed);
-  } else return;
-
-  float accumulated = 0.0;
-  unsigned long lastTime = micros();
-  while (accumulated < target) {
-
-    update();
-    accumulated = fabs(yaw);
-    if (millis() - lastTime > 5000) {
-          Serial.println("Turn timed out!");
-          break; // Exit the loop if it takes too long
-  }
-  driveStop();
-  // Update current orientation
-  if (degrees > 0)
-    currentDirection = (currentDirection + 1) % 4;
-  else if (degrees < 0)
-    currentDirection = (currentDirection + 3) % 4;
-}
-}
-
-// ======================
-// Function: moveForwardOneCell()
-// Drives forward exactly one cell (25 cm) using encoder feedback.
-void moveForwardOneCell(int speed) {
-  enc.write(0);
-  driveForward(speed);
-  while (abs(enc.read()) < cellDistanceTicks) {
-    // Optionally add gyro corrections here if needed.
-  }
-  driveStop();
-  // Update cell position based on current direction:
-  if (currentDirection == 0) posY += 1;       // North
-  else if (currentDirection == 1) posX += 1;  // East
-  else if (currentDirection == 2) posY -= 1;  // South
-  else if (currentDirection == 3) posX -= 1;  // West
-}
 
 
 void stopMovement() {
@@ -316,7 +296,7 @@ void computeDistances(int targetX, int targetY) {
 
         // Check neighbors (if no wall between current cell and neighbor)
         // North neighbor:
-        if (!(wallsGrid[y][x] & 0x01) && y < MAZE_SIZE - 1) {
+        /*if (!(wallsGrid[y][x] & 0x01) && y < MAZE_SIZE - 1) {
           if (distanceGrid[y+1][x] < minNeighbor) minNeighbor = distanceGrid[y+1][x];
         }
         // East neighbor:
@@ -334,7 +314,15 @@ void computeDistances(int targetX, int targetY) {
         if (minNeighbor != MAX_DISTANCE && distanceGrid[y][x] != minNeighbor + 1) {
           distanceGrid[y][x] = minNeighbor + 1;
           updated = true;
-        }
+        }*/
+        if (y < MAZE_SIZE - 1 && !(wallsGrid[y][x] & 0x01)) minNeighbor = min(minNeighbor, distanceGrid[y + 1][x]);
+        if (x < MAZE_SIZE - 1 && !(wallsGrid[y][x] & 0x02)) minNeighbor = min(minNeighbor, distanceGrid[y][x + 1]);
+        if (y > 0 && !(wallsGrid[y][x] & 0x04)) minNeighbor = min(minNeighbor, distanceGrid[y - 1][x]);
+        if (x > 0 && !(wallsGrid[y][x] & 0x08)) minNeighbor = min(minNeighbor, distanceGrid[y][x - 1]);
+        if (minNeighbor != MAX_DISTANCE && distanceGrid[y][x] > minNeighbor + 1) {
+              distanceGrid[y][x] = minNeighbor + 1;
+              updated = true;
+          }
       }
     }
   }
@@ -376,9 +364,9 @@ void loop() {
     
     // Print detected walls
     Serial.print("Walls at (");
-    Serial.print(posY);
-    Serial.print(", ");
     Serial.print(posX);
+    Serial.print(", ");
+    Serial.print(posY);
     Serial.print("): ");
     
     if (wallsGrid[posY][posX] & 0x01) Serial.print("North ");
@@ -394,35 +382,38 @@ void loop() {
     if (!(wallsGrid[posY][posX] & 0x02) && posX + 1 < MAZE_SIZE) { // No East wall & within boundary
       driveTurnRight(100);
       delay(500);
-      driveForward(100);
-      delay(1000);
-      updatePosition(0, 1);
-    } 
-    else if (!(wallsGrid[posY][posX] & 0x01) && posY + 1 < MAZE_SIZE) { // No North wall & within boundary
-      driveForward(100);
+      moveForward(100);
       delay(1000);
       updatePosition(1, 0);
+    } 
+    else if (!(wallsGrid[posY][posX] & 0x01) && posY + 1 < MAZE_SIZE) { // No North wall & within boundary
+      moveForward(100);
+      delay(1000);
+      updatePosition(0, 1);
     } 
     else if (!(wallsGrid[posY][posX] & 0x08) && posX - 1 >= 0) { // No West wall & within boundary
       driveTurnLeft(100);
       delay(500);
-      driveForward(100);
+      moveForward(100);
       delay(1000);
-      updatePosition(0, -1);
+      updatePosition(-1, 0);
     }  
     else {  // Dead end, turn around
       driveTurnLeft(100);
       delay(500);
       driveTurnLeft(100);
       delay(500);
-      driveForward(100);
+      moveForward(100);
       delay(1000);
-      updatePosition(-1, 0);
+      updatePosition(0, -1);
     }
-    Serial.print(wallsGrid[posY][posX], BIN);
-    Serial.print("\t");
-    Serial.println();
-  }
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      for (int x = 0; x < MAZE_SIZE; x++) {
+        Serial.print(wallsGrid[y][x], BIN);
+        Serial.print("\t");
+      }
+      Serial.println();
+    }
     // Load maze data from EEPROM if available
     if(EEPROM.read(EEPROM_FLAG_ADDR) == 0xA5) {
       Serial.println("\nLoading maze from EEPROM...");
@@ -442,29 +433,29 @@ void loop() {
       }
       Serial.println("Distance Grid Initialized.");
     }
-  
-  
+  }
   computeDistances(GOAL_X, GOAL_Y);
-  //decideAndMove(false);
-  if(posX == GOAL_X && posY == GOAL_Y) {
-    driveStop();
-     mazeSolved = true;
-    Serial.println("Goal reached! Exploration complete.");
-    EEPROM.update(EEPROM_FLAG_ADDR, 0xA5);
-    int idx = 0;
-    for (int y = 0; y < MAZE_SIZE; y++) {
-      for (int x = 0; x < MAZE_SIZE; x++) {
-        EEPROM.update(EEPROM_MAZE_START_ADDR + idx, wallsGrid[y][x]);
-        idx++;
-       }
+    //decideAndMove(false);
+    if(posX == GOAL_X && posY == GOAL_Y) {
+      driveStop();
+      mazeSolved = true;
+      Serial.println("Goal reached! Exploration complete.");
+      EEPROM.update(EEPROM_FLAG_ADDR, 0xA5);
+      int idx = 0;
+      for (int y = 0; y < MAZE_SIZE; y++) {
+        for (int x = 0; x < MAZE_SIZE; x++) {
+          EEPROM.update(EEPROM_MAZE_START_ADDR + idx, wallsGrid[y][x]);
+          idx++;
+        }
+      }
+      Serial.println("Maze data saved to EEPROM.");
+      // Prepare for a fast run using the known maze.
+      computeDistances(GOAL_X, GOAL_Y);
+      posX = START_X; posY = START_Y;
+      currentDirection = 0;
+      fastRun = true;
     }
-    Serial.println("Maze data saved to EEPROM.");
-    // Prepare for a fast run using the known maze.
-    computeDistances(GOAL_X, GOAL_Y);
-    posX = START_X; posY = START_Y;
-    currentDirection = 0;
-    fastRun = true;
-  } 
+   
   else if(fastRun) {
     if(posX == GOAL_X && posY == GOAL_Y) {
       driveStop();
@@ -477,7 +468,3 @@ void loop() {
   }
   delay(5);
 }
-
-
-
-
