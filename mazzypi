@@ -1,0 +1,406 @@
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h> 
+#include <Wire.h>
+#include <EEPROM.h>        // EEPROM library
+#include <Ultrasonic.h>
+#include <Encoder.h>
+
+// ======================
+// Hardware Pin Assignments
+// ======================
+// Rotary Encoder pins
+const int ENC_PIN_A = A1;
+const int ENC_PIN_B = A0;
+
+// Motor driver pins (assuming dual H-bridge for two motors)
+const int ENA = 10;   // Left motor PWM
+const int IN1 = 5;    // Left motor direction
+const int IN2 = 4;
+const int ENB = 9;   // Right motor PWM
+const int IN3 = 3;   // Right motor direction
+const int IN4 = 2;
+
+// Ultrasonic sensor pins (3 sensors: front, left, right)
+const int TRIG_FRONT = 6;
+const int ECHO_FRONT = 7;
+const int TRIG_LEFT  = 8;
+const int ECHO_LEFT  = 11;
+const int TRIG_RIGHT = 12;
+const int ECHO_RIGHT = 13;
+
+// ======================
+// Maze & Competition Parameters (from Rule Book [])
+// ======================
+const int MAZE_SIZE = 10;   // 10 x 10 grid
+const int CELL_SIZE_CM = 25;  // Each cell is 25cm x 25cm
+
+// Define starting and goal positions.
+// For example: starting at bottom-left (0,0) and goal at top-right (9,9)
+const int START_X = 0;
+const int START_Y = 0;
+const int GOAL_X  = 9;
+const int GOAL_Y  = 9;
+
+// Maximum distance value for flood-fill propagation
+const int MAX_DISTANCE = 255;
+// Threshold (in cm) to consider a wall detected by an ultrasonic sensor
+const int WALL_DISTANCE_CM = 15;  // Adjust as needed
+
+// Encoder threshold for one cell travel (calibrate for 25cm per cell)
+int cellDistanceTicks = 200; // Example value; adjust based on your setup
+
+// ======================
+// Global Variables for Maze Navigation
+// ======================
+int currentDirection = 0;  // Orientation: 0 = North, 1 = East, 2 = South, 3 = West
+int posX = START_X, posY = START_Y;  // Robot's current cell position
+uint8_t wallsGrid[MAZE_SIZE][MAZE_SIZE] = {0}; 
+// Maze mapping arrays
+uint8_t distanceGrid[MAZE_SIZE][MAZE_SIZE];   // Flood-fill distances
+
+// Wall bits: bit0 = North, bit1 = East, bit2 = South, bit3 = West
+
+// ======================
+// MPU-6050 Sensor
+// ======================
+Adafruit_MPU6050 mpu;
+// Initialize MPU6050
+float gyroZoffset = 0; // gyroZoffset=GyroErrorZ
+float yaw = 0;
+unsigned long lastMovementTime = 0;
+const unsigned long resetThreshold = 5000; // Reset yaw if stationary for 5s
+
+
+// ======================
+// EEPROM
+// ======================
+// EEPROM storage addresses
+const int EEPROM_FLAG_ADDR = 0;              // Flag address to indicate stored maze data
+const int EEPROM_MAZE_START_ADDR = 1;          // Maze data start address
+
+// ======================
+// EEPROM
+// ======================
+Encoder enc(ENC_PIN_A, ENC_PIN_B);
+
+long measureDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH);
+  float distance = (duration / 2.0) * 0.0343;
+  return distance;
+}
+// ======================
+// Function: scanWalls()
+// Reads the three ultrasonic sensors and updates wall information
+// for the current cell. Since no rear sensor is provided, we assume no wall.
+void scanWalls() {
+    long dFront = measureDistance(TRIG_FRONT, ECHO_FRONT);
+    long dLeft = measureDistance(TRIG_LEFT, ECHO_LEFT);
+    long dRight = measureDistance(TRIG_RIGHT, ECHO_RIGHT);
+
+    uint8_t wallBits = 0;
+    if (dFront < WALL_DISTANCE_CM) {
+        wallBits |= 0x01; // North wall
+    }
+    if (dLeft < WALL_DISTANCE_CM) {
+        wallBits |= 0x08; // West wall
+    }
+    if (dRight < WALL_DISTANCE_CM) {
+        wallBits |= 0x02; // East wall
+    }
+    wallsGrid[posY][posX] |= wallBits;
+
+    Serial.print("Walls at (");
+    Serial.print(posX);
+    Serial.print(", ");
+    Serial.print(posY);
+    Serial.print("): ");
+    Serial.println(wallsGrid[posY][posX], BIN);
+
+    for (int y = 0; y < MAZE_SIZE; y++) {
+    for (int x = 0; x < MAZE_SIZE; x++) {
+      Serial.print(wallsGrid[y][x], BIN);
+      Serial.print("\t");
+    }
+    Serial.println();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  
+  // Initialize motor control pins
+  pinMode(ENA, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  driveStop();
+  
+  // Setup ultrasonic sensor pins
+  pinMode(TRIG_FRONT, OUTPUT);
+  pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_LEFT, OUTPUT);
+  pinMode(ECHO_LEFT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT);
+  pinMode(ECHO_RIGHT, INPUT);
+
+  
+  // Initialize maze mapping arrays
+  Serial.println("Starting Walls Grid Initialization...");
+  for (int y = 0; y < MAZE_SIZE; y++) {
+    for (int x = 0; x < MAZE_SIZE; x++) {
+      wallsGrid[y][x] = 0;
+      distanceGrid[y][x] = MAX_DISTANCE;
+      Serial.print(wallsGrid[y][x], BIN);
+      Serial.print("\t");
+    }
+    Serial.println();
+  }
+  Serial.println("Walls Grid Initialization Completed.\n");
+  
+  
+  // Set maze outer boundaries:
+  for (int i = 0; i < MAZE_SIZE; i++) {
+    wallsGrid[0][i]       |= 0x04; // South wall for bottom row
+    wallsGrid[MAZE_SIZE-1][i] |= 0x01; // North wall for top row
+    wallsGrid[i][0]       |= 0x08; // West wall for left column
+    wallsGrid[i][MAZE_SIZE-1] |= 0x02; // East wall for right column
+  }
+
+    // Mark starting cell boundaries if needed (e.g. start at (0,0))
+  wallsGrid[START_Y][START_X] |= 0x08; // Example: west wall at start
+
+  Serial.println("Walls Grid After Setting Boundaries:");
+  
+  // Set initial position and orientation
+  posX = START_X;
+  posY = START_Y;
+  currentDirection = 0;  // Assume starting facing North
+  
+  // Load maze data from EEPROM if available
+  if(EEPROM.read(EEPROM_FLAG_ADDR) == 0xA5) {
+    Serial.println("\nLoading maze from EEPROM...");
+    for (int idx = 0; idx < MAZE_SIZE * MAZE_SIZE; idx++) {
+      int cx = idx % MAZE_SIZE;
+      int cy = idx / MAZE_SIZE;
+      wallsGrid[cy][cx] = EEPROM.read(EEPROM_MAZE_START_ADDR + idx);
+    }
+    Serial.println("Loaded maze fr om EEPROM.");
+    //computeDistances(GOAL_X, GOAL_Y);
+  } else {
+    // Initialize distance grid with a simple Manhattan distance heuristic
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      for (int x = 0; x < MAZE_SIZE; x++) {
+        distanceGrid[y][x] = abs(GOAL_X - x) + abs(GOAL_Y - y);
+      }
+    }
+    Serial.println("Distance Grid Initialized.");
+  }
+}
+
+void driveStop() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void driveForward(int speed) {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void driveTurnLeft(int speed) {
+  // In-place left turn: left motor backward, right motor forward
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void driveTurnRight(int speed) {
+  // In-place right turn: left motor forward, right motor backward
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+// === Position Update ===
+void updatePosition(int dx, int dy) {
+  posX += dx;
+  posY += dy;
+  Serial.print("Moved to: ("); Serial.print(posX); Serial.print(", "); Serial.print(posY); Serial.println(")");
+} 
+
+void stopMovement() {
+  driveForward(0); // Stop motors
+  Serial.println("Exploration complete. Robot stopped.");
+}
+
+void computeDistances(int targetX, int targetY) {
+  // Initialize all cells to MAX_DISTANCE
+  for (int y = 0; y < MAZE_SIZE; y++) {
+    for (int x = 0; x < MAZE_SIZE; x++) {
+      distanceGrid[y][x] = MAX_DISTANCE;
+  }
+  distanceGrid[targetY][targetX] = 0;
+
+  bool updated = true;
+  while (updated) {
+    updated = false;
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      for (int x = 0; x < MAZE_SIZE; x++) {
+        if (x == targetX && y == targetY) continue;
+        uint8_t minNeighbor = MAX_DISTANCE;
+
+        // Check neighbors (if no wall between current cell and neighbor)
+        // North neighbor:
+        if (!(wallsGrid[y][x] & 0x01) && y < MAZE_SIZE - 1) {
+          if (distanceGrid[y+1][x] < minNeighbor) minNeighbor = distanceGrid[y+1][x];
+        }
+        // East neighbor:
+        if (!(wallsGrid[y][x] & 0x02) && x < MAZE_SIZE - 1) {
+          if (distanceGrid[y][x+1] < minNeighbor) minNeighbor = distanceGrid[y][x+1];
+        }
+        // South neighbor:
+        if (!(wallsGrid[y][x] & 0x04) && y > 0) {
+          if (distanceGrid[y-1][x] < minNeighbor) minNeighbor = distanceGrid[y-1][x];
+        }
+        // West neighbor:
+        if (!(wallsGrid[y][x] & 0x08) && x > 0) {
+          if (distanceGrid[y][x-1] < minNeighbor) minNeighbor = distanceGrid[y][x-1];
+        }
+        if (minNeighbor != MAX_DISTANCE && distanceGrid[y][x] != minNeighbor + 1) {
+          distanceGrid[y][x] = minNeighbor + 1;
+          updated = true;
+        }
+      }
+    }
+  }
+}
+Serial.println("Distance Grid:");
+  for (int y = 0; y < MAZE_SIZE; y++) {
+    for (int x = 0; x < MAZE_SIZE; x++) {
+      if (distanceGrid[y][x] == MAX_DISTANCE) Serial.print("X\t"); // Unreachable cells
+      else Serial.print(distanceGrid[y][x]); Serial.print("\t");
+    }
+    Serial.println();
+  }
+  Serial.println("=================================");
+}
+
+void loop() {
+  static bool mazeSolved = false;
+  static bool fastRun = false;
+  
+  if(!mazeSolved) {
+    // Ensure the bot stops at the maze boundary
+    if (posX >= MAZE_SIZE || posY >= MAZE_SIZE) {
+      Serial.println("Maze limit reached. Stopping.");
+      stopMovement();
+      return;
+    }
+
+    // Exploration phase: scan walls, update distances, and decide next move.
+    scanWalls();
+
+    // Print sensor readings
+    long dFront = measureDistance(TRIG_FRONT, ECHO_FRONT);
+    long dLeft = measureDistance(TRIG_LEFT, ECHO_LEFT);
+    long dRight = measureDistance(TRIG_RIGHT, ECHO_RIGHT);
+    
+    Serial.print("Distances (cm) - Front: "); Serial.print(dFront);
+    Serial.print(", Left: "); Serial.print(dLeft);
+    Serial.print(", Right: "); Serial.println(dRight);
+    
+    // Print detected walls
+    Serial.print("Walls at (");
+    Serial.print(posX);
+    Serial.print(", ");
+    Serial.print(posY);
+    Serial.print("): ");
+    
+    if (wallsGrid[posY][posX] & 0x01) Serial.print("North ");
+    if (wallsGrid[posY][posX] & 0x02) Serial.print("East ");
+    if (wallsGrid[posY][posX] & 0x04) Serial.print("South ");
+    if (wallsGrid[posY][posX] & 0x08) Serial.print("West ");
+    
+    Serial.println();
+
+    delay(1000);  // Slow down movement updates
+
+    // Move based on wall detection (Right-hand rule) while checking maze size
+    if (!(wallsGrid[posY][posX] & 0x02) && posX + 1 < MAZE_SIZE) { // No East wall & within boundary
+      driveTurnRight(100);
+      delay(500);
+      driveForward(100);
+      delay(1000);
+      updatePosition(1, 0);
+    } 
+    else if (!(wallsGrid[posY][posX] & 0x01) && posY + 1 < MAZE_SIZE) { // No North wall & within boundary
+      driveForward(100);
+      delay(1000);
+      updatePosition(0, 1);
+    } 
+    else if (!(wallsGrid[posY][posX] & 0x08) && posX - 1 >= 0) { // No West wall & within boundary
+      driveTurnLeft(100);
+      delay(500);
+      driveForward(100);
+      delay(1000);
+      updatePosition(-1, 0);
+    }  
+    else {  // Dead end, turn around
+      driveTurnLeft(100);
+      delay(500);
+      driveTurnLeft(100);
+      delay(500);
+      driveForward(100);
+      delay(1000);
+      updatePosition(0, -1);
+    }
+    for (int y = 0; y < MAZE_SIZE; y++) {
+      for (int x = 0; x < MAZE_SIZE; x++) {
+        Serial.print(wallsGrid[y][x], BIN);
+        Serial.print("\t");
+      }
+      Serial.println();
+    }
+    // Load maze data from EEPROM if available
+    if(EEPROM.read(EEPROM_FLAG_ADDR) == 0xA5) {
+      Serial.println("\nLoading maze from EEPROM...");
+      for (int idx = 0; idx < MAZE_SIZE * MAZE_SIZE; idx++) {
+        int cx = idx % MAZE_SIZE;
+        int cy = idx / MAZE_SIZE;
+        wallsGrid[cy][cx] = EEPROM.read(EEPROM_MAZE_START_ADDR + idx);
+      }
+      Serial.println("Loaded maze fr om EEPROM.");
+      computeDistances(GOAL_X, GOAL_Y);
+    } else {
+      // Initialize distance grid with a simple Manhattan distance heuristic
+      for (int y = 0; y < MAZE_SIZE; y++) {
+        for (int x = 0; x < MAZE_SIZE; x++) {
+          distanceGrid[y][x] = abs(GOAL_X - x) + abs(GOAL_Y - y);
+        }
+      }
+      Serial.println("Distance Grid Initialized.");
+    }
+  }
+}
+
+
+
